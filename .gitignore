@@ -1,0 +1,33 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Training outputs
+runs/
+results/
+logs/
+
+# Model weights
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Dataset folders
+first_data/
+pretrained_weights/
+
+# OS files
+.DS_Store
+ultralytics/

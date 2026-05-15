@@ -1,0 +1,10 @@
+path: /path/to/dataset
+
+train: images/train
+val: images/val
+
+names:
+  0: plain_particle
+  1: dirt
+  2: scratch
+  3: collision
