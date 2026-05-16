@@ -12,7 +12,7 @@ env/
 # IDE
 .vscode/
 .idea/
-
+.agents/
 # Training outputs
 runs/
 results/
@@ -26,8 +26,10 @@ logs/
 
 # Dataset folders
 first_data/
+data/
 pretrained_weights/
-
+data_for_train/
+seg/
 # OS files
 .DS_Store
 ultralytics/
