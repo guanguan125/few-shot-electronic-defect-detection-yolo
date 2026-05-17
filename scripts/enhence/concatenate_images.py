@@ -53,6 +53,9 @@ class Placement:
     rotation: float
     scale: float
     black_ratio: float
+    target_luma: float
+    background_luma: float
+    brightness_delta: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,17 +69,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--positive-root", type=Path, default=DEFAULT_POSITIVE_ROOT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--num", type=int, default=100, help="Debug default: 100 images.")
+    parser.add_argument(
+        "--per-class-targets",
+        type=int,
+        default=0,
+        help=(
+            "Generate an exact number of pasted targets for every class. "
+            "When this is > 0, --num is ignored."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--min-targets", type=int, default=1)
     parser.add_argument("--max-targets", type=int, default=3)
     parser.add_argument("--scale-min", type=float, default=0.5)
     parser.add_argument("--scale-max", type=float, default=2.0)
+    parser.add_argument(
+        "--small-target-area",
+        type=int,
+        default=1500,
+        help=(
+            "If a target's visible alpha area is below this many pixels, "
+            "it will only be enlarged, not shrunk."
+        ),
+    )
     parser.add_argument("--required-black-ratio", type=float, default=0.95)
     parser.add_argument("--max-overlap-ratio", type=float, default=0.05)
     parser.add_argument("--max-place-attempts", type=int, default=400)
     parser.add_argument("--max-image-retries", type=int, default=30)
     parser.add_argument("--alpha-threshold", type=int, default=8)
+    parser.add_argument(
+        "--brightness-strength",
+        type=float,
+        default=0.35,
+        help=(
+            "How strongly to shift target brightness toward the local background "
+            "brightness before pasting. Default 0.35 means a gentle approach; "
+            "1.0 means full match."
+        ),
+    )
     parser.add_argument(
         "--mask-erode",
         type=int,
@@ -145,6 +176,13 @@ def load_crop_assets(crop_root: Path) -> list[CropAsset]:
     return assets
 
 
+def group_crop_assets(crop_assets: list[CropAsset]) -> dict[int, list[CropAsset]]:
+    grouped = {class_id: [] for class_id in CLASS_NAMES}
+    for asset in crop_assets:
+        grouped[asset.class_id].append(asset)
+    return grouped
+
+
 def clear_black_mask(image: Image.Image, seg_module: ModuleType, erode: int) -> np.ndarray:
     rgb = np.asarray(image.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
@@ -167,19 +205,29 @@ def trim_alpha(image: Image.Image, alpha_threshold: int) -> Image.Image | None:
     return rgba.crop(bbox)
 
 
+def visible_alpha_area(image: Image.Image, alpha_threshold: int) -> int:
+    alpha = np.asarray(image.convert("RGBA").getchannel("A"))
+    return int((alpha > alpha_threshold).sum())
+
+
 def transform_crop(
     crop_path: Path,
     rng: random.Random,
     scale_min: float,
     scale_max: float,
     alpha_threshold: int,
+    small_target_area: int,
 ) -> tuple[Image.Image, float, float] | None:
     with Image.open(crop_path) as raw:
         crop = trim_alpha(raw, alpha_threshold)
     if crop is None:
         return None
 
-    scale = rng.uniform(scale_min, scale_max)
+    effective_scale_min = scale_min
+    if visible_alpha_area(crop, alpha_threshold) < small_target_area:
+        effective_scale_min = max(1.0, scale_min)
+    effective_scale_max = max(scale_max, effective_scale_min)
+    scale = rng.uniform(effective_scale_min, effective_scale_max)
     new_size = (
         max(1, int(round(crop.width * scale))),
         max(1, int(round(crop.height * scale))),
@@ -201,6 +249,36 @@ def transform_crop(
 
 def alpha_mask(image: Image.Image, alpha_threshold: int) -> np.ndarray:
     return np.asarray(image.getchannel("A")) > alpha_threshold
+
+
+def match_target_brightness(
+    target: Image.Image,
+    background_patch: Image.Image,
+    target_mask: np.ndarray,
+    alpha_threshold: int,
+    strength: float,
+) -> tuple[Image.Image, float, float, float]:
+    rgba = np.array(target.convert("RGBA"), dtype=np.float32)
+    alpha = rgba[..., 3]
+    visible = target_mask & (alpha > alpha_threshold)
+    if not visible.any() or strength <= 0:
+        return target, 0.0, 0.0, 0.0
+
+    strength = float(np.clip(strength, 0.0, 1.0))
+    bg_rgb = np.asarray(background_patch.convert("RGB"), dtype=np.float32)
+    coeff = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+
+    target_luma = rgba[..., :3][visible] @ coeff
+    background_luma = bg_rgb[visible] @ coeff
+    weights = np.clip(alpha[visible] / 255.0, 0.0, 1.0)
+
+    target_mean = float(np.average(target_luma, weights=weights))
+    background_mean = float(np.average(background_luma, weights=weights))
+    delta = (background_mean - target_mean) * strength
+
+    rgba[..., :3] = np.clip(rgba[..., :3] + delta, 0, 255)
+    adjusted = Image.fromarray(rgba.astype(np.uint8), mode="RGBA")
+    return adjusted, target_mean, background_mean, float(delta)
 
 
 def find_position(
@@ -360,9 +438,11 @@ def compose_one(
     index: int,
     background_paths: list[Path],
     crop_assets: list[CropAsset],
+    crop_assets_by_class: dict[int, list[CropAsset]],
     seg_module: ModuleType,
     rng: random.Random,
     args: argparse.Namespace,
+    requested_class_ids: list[int] | None = None,
 ) -> tuple[Image.Image, np.ndarray, list[Placement], Path]:
     for _ in range(args.max_image_retries):
         background_path = rng.choice(background_paths)
@@ -376,27 +456,54 @@ def compose_one(
         canvas = background.convert("RGBA")
         occupied_mask = np.zeros(clear_mask.shape, dtype=bool)
         placements: list[Placement] = []
-        target_count = rng.randint(args.min_targets, args.max_targets)
+        failed_required_target = False
 
-        for _target_index in range(target_count):
-            asset = rng.choice(crop_assets)
+        if requested_class_ids is None:
+            target_count = rng.randint(args.min_targets, args.max_targets)
+            target_assets = [rng.choice(crop_assets) for _ in range(target_count)]
+        else:
+            target_assets = [
+                rng.choice(crop_assets_by_class[class_id])
+                for class_id in requested_class_ids
+            ]
+
+        for asset in target_assets:
             transformed = transform_crop(
                 asset.path,
                 rng,
                 args.scale_min,
                 args.scale_max,
                 args.alpha_threshold,
+                args.small_target_area,
             )
             if transformed is None:
+                failed_required_target = requested_class_ids is not None
+                if failed_required_target:
+                    break
                 continue
 
             target, rotation, scale = transformed
             target_mask = alpha_mask(target, args.alpha_threshold)
             position = find_position(target_mask, clear_mask, occupied_mask, rng, args)
             if position is None:
+                failed_required_target = requested_class_ids is not None
+                if failed_required_target:
+                    break
                 continue
 
             left, top, black_ratio = position
+            background_patch = canvas.crop(
+                (left, top, left + target.width, top + target.height)
+            )
+            target, target_luma, background_luma, brightness_delta = (
+                match_target_brightness(
+                    target,
+                    background_patch,
+                    target_mask,
+                    args.alpha_threshold,
+                    args.brightness_strength,
+                )
+            )
             x1, y1, x2, y2 = paste_target(
                 canvas, target, target_mask, left, top, occupied_mask
             )
@@ -412,10 +519,13 @@ def compose_one(
                     rotation=rotation,
                     scale=scale,
                     black_ratio=black_ratio,
+                    target_luma=target_luma,
+                    background_luma=background_luma,
+                    brightness_delta=brightness_delta,
                 )
             )
 
-        if placements:
+        if placements and not failed_required_target:
             return canvas.convert("RGB"), clear_mask, placements, background_path
 
     raise RuntimeError(f"failed to place any target for synthetic image {index}")
@@ -431,6 +541,31 @@ def write_stats(output_root: Path, rows: list[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
+def build_balanced_batches(
+    per_class_targets: int,
+    max_targets: int,
+    val_ratio: float,
+    rng: random.Random,
+) -> list[tuple[str, list[int]]]:
+    batches: list[tuple[str, list[int]]] = []
+    val_per_class = int(round(per_class_targets * val_ratio))
+    train_per_class = per_class_targets - val_per_class
+
+    for split, count_per_class in (
+        ("train", train_per_class),
+        ("val", val_per_class),
+    ):
+        queue: list[int] = []
+        for class_id in CLASS_NAMES:
+            queue.extend([class_id] * count_per_class)
+        rng.shuffle(queue)
+
+        for start in range(0, len(queue), max_targets):
+            batches.append((split, queue[start : start + max_targets]))
+
+    return batches
+
+
 def main() -> None:
     args = parse_args()
     rng = random.Random(args.seed)
@@ -439,25 +574,56 @@ def main() -> None:
     output_root = args.output.resolve()
 
     crop_assets = load_crop_assets(crop_root)
+    crop_assets_by_class = group_crop_assets(crop_assets)
     background_paths = iter_images(positive_root)
     if not crop_assets:
         raise FileNotFoundError(f"no crop PNGs found in {crop_root}")
+    missing_classes = [
+        CLASS_NAMES[class_id]
+        for class_id, assets in crop_assets_by_class.items()
+        if not assets
+    ]
+    if missing_classes:
+        raise FileNotFoundError(f"missing crop PNGs for classes: {missing_classes}")
     if not background_paths:
         raise FileNotFoundError(f"no background images found in {positive_root}")
     if args.min_targets < 1 or args.max_targets < args.min_targets:
         raise ValueError("--min-targets/--max-targets are invalid")
+    if args.max_targets < 1:
+        raise ValueError("--max-targets must be >= 1")
+    if args.per_class_targets < 0:
+        raise ValueError("--per-class-targets must be >= 0")
 
     prepare_output(output_root, args.clean)
     write_data_yaml(output_root)
     seg_module = load_seg_module()
 
+    if args.per_class_targets > 0:
+        batches = build_balanced_batches(
+            args.per_class_targets,
+            args.max_targets,
+            args.val_ratio,
+            rng,
+        )
+    else:
+        batches = [
+            (split_for_index(index, args.num, args.val_ratio), [])
+            for index in range(1, args.num + 1)
+        ]
+
     rows: list[dict[str, object]] = []
-    for index in range(1, args.num + 1):
-        split = split_for_index(index, args.num, args.val_ratio)
+    for index, (split, requested_class_ids) in enumerate(batches, start=1):
         stem = f"synthetic_{index:05d}"
 
         image, clear_mask, placements, background_path = compose_one(
-            index, background_paths, crop_assets, seg_module, rng, args
+            index,
+            background_paths,
+            crop_assets,
+            crop_assets_by_class,
+            seg_module,
+            rng,
+            args,
+            requested_class_ids or None,
         )
 
         image_path = output_root / "images" / split / f"{stem}.jpg"
@@ -494,11 +660,14 @@ def main() -> None:
                     "rotation": round(placement.rotation, 4),
                     "scale": round(placement.scale, 4),
                     "black_ratio": round(placement.black_ratio, 6),
+                    "target_luma": round(placement.target_luma, 4),
+                    "background_luma": round(placement.background_luma, 4),
+                    "brightness_delta": round(placement.brightness_delta, 4),
                 }
             )
 
         print(
-            f"[{index:04d}/{args.num:04d}] {split}/{stem}.jpg "
+            f"[{index:04d}/{len(batches):04d}] {split}/{stem}.jpg "
             f"objects={len(placements)} bg={background_path.name}"
         )
 

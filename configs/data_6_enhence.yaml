@@ -1,0 +1,12 @@
+path: /home/fhr/programs/projects/detection/first_data/enhence/concatenate_yolo
+
+train: images/train
+val: images/val
+
+names:
+  0: collision
+  1: dirt
+  2: plain_particle_dent
+  3: plain_particle_particle
+  4: scratch_damage
+  5: scratch_mark
