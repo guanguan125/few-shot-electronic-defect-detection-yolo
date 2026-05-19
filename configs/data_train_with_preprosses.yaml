@@ -1,0 +1,18 @@
+path: /home/fhr/programs/projects/detection/first_data/data_train_with_preprosses
+
+train: images/train
+val: images/val
+
+channels: 4
+
+names:
+  0: plain_particle
+  1: dirt
+  2: scratch
+  3: collision
+
+preprocess_channels:
+  0: gray
+  1: clahe
+  2: scharr
+  3: blackhat

@@ -33,3 +33,4 @@ seg/
 # OS files
 .DS_Store
 ultralytics/
+yolo26n.pt

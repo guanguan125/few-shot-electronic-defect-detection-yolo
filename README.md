@@ -195,3 +195,12 @@ conda activate yolo
 ```bash
 python scripts/inference.py --clean --batch 1 --imgsz 1024
 ```
+
+
+
+
+
+
+
+第二种增强方法，图像预处理
+/home/fhr/programs/projects/detection/scripts/prepross
