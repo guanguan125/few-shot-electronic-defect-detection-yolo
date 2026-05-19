@@ -14,8 +14,8 @@ import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SOURCE_ROOT = PROJECT_ROOT / "first_data" / "train" / "负样本"
-DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "first_data" / "data_train_with_preprosses"
-DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "data_train_with_preprosses.yaml"
+DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "first_data" / "data_train_with_preprocess"
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "data_train_with_preprocess.yaml"
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 PREPROCESS_CHANNELS = ("gray", "clahe", "scharr", "blackhat")
